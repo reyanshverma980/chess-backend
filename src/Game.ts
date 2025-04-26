@@ -57,6 +57,22 @@ export class Game {
 
     // add move to db
 
+    if (this.board.turn() === "w") {
+      this.player1.socket.send(
+        JSON.stringify({
+          type: MOVE,
+          payload: { move },
+        })
+      );
+    } else {
+      this.player2.socket.send(
+        JSON.stringify({
+          type: MOVE,
+          payload: { move },
+        })
+      );
+    }
+
     if (this.board.isGameOver()) {
       const result = this.board.isCheckmate()
         ? this.board.turn() === "b"
@@ -82,22 +98,6 @@ export class Game {
         })
       );
       return;
-    }
-
-    if (this.board.turn() === "w") {
-      this.player1.socket.send(
-        JSON.stringify({
-          type: MOVE,
-          payload: { move },
-        })
-      );
-    } else {
-      this.player2.socket.send(
-        JSON.stringify({
-          type: MOVE,
-          payload: { move },
-        })
-      );
     }
   }
 }

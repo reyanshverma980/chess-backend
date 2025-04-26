@@ -50,36 +50,22 @@ export class GameManager {
       const { player1, player2 } = game;
 
       if (player1?.socket === socket) {
-        // Notify player2 that they won
         player2?.socket.send(
           JSON.stringify({
             type: PLAYER_LEFT,
-            payload: {
-              result: "You Win",
-            },
           })
         );
-
-        // Delete the game immediately
-        this.games.delete(gameId);
-        break;
-      }
-
-      if (player2?.socket === socket) {
-        // Notify player1 that they won
+      } else if (player2?.socket === socket) {
         player1?.socket.send(
           JSON.stringify({
             type: PLAYER_LEFT,
-            payload: {
-              result: "You Win",
-            },
           })
         );
-
-        // Delete the game immediately
-        this.games.delete(gameId);
-        break;
       }
+
+      // Delete the game immediately
+      this.games.delete(gameId);
+      break;
     }
   }
 
