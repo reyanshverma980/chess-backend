@@ -1,133 +1,129 @@
-import { WebSocket } from "ws";
 import { Game } from "./Game.js";
-import { INIT_GAME, MOVE, PLAYER_LEFT } from "./messages.js";
-
-type Player = {
-  id: string;
-  socket: WebSocket;
-};
+import { INIT_GAME, MOVE, RECONNECT } from "./messages.js";
+import { redis } from "./app.js";
+import { Socket } from "socket.io";
 
 export class GameManager {
   private games: Map<string, Game>;
-  private players: Map<WebSocket, Player>;
-  private guestPlayers: Map<WebSocket, Player>;
-  private pendingPlayer: Player | null;
-  private pendingGuest: Player | null;
+  private socketByUserId: Map<string, Socket>;
 
   constructor() {
     this.games = new Map();
-    this.players = new Map();
-    this.guestPlayers = new Map();
-    this.pendingPlayer = null;
-    this.pendingGuest = null;
+    this.socketByUserId = new Map();
   }
 
-  addUser(id: string, socket: WebSocket) {
-    this.players.set(socket, { socket, id });
+  private getIdFromSocket(socket: Socket): string | undefined {
+    for (const [id, userSocket] of this.socketByUserId.entries()) {
+      if (socket === userSocket) {
+        return id;
+      }
+    }
+  }
+
+  async addUser(id: string, socket: Socket) {
+    this.socketByUserId.set(id, socket);
+    const { gameId } = await redis.hgetall(`activePlayer:${id}`);
+    if (gameId) {
+      this.reconnect(gameId, id, socket);
+    } else {
+      await redis.hset(`activePlayer:${id}`, { gameId: "" });
+    }
     this.addHandler({ id, socket });
   }
 
-  addGuest(id: string, socket: WebSocket) {
-    this.guestPlayers.set(socket, { id, socket });
-    this.addHandlerGuest({ id, socket });
+  async removeUser(socket: Socket) {
+    const id = this.getIdFromSocket(socket);
+    if (!id) {
+      console.error("No id associated with socket");
+      return;
+    }
+    this.socketByUserId.delete(id);
+    const { gameId } = await redis.hgetall(`activePlayer:${id}`);
+    if (!gameId) {
+      console.error(`No game found for user with ID ${id}`);
+      return;
+    }
+    this.games.delete(gameId);
   }
 
-  removeUser(socket: WebSocket) {
-    if (!this.players.has(socket) && !this.guestPlayers.has(socket)) return;
-    this.players.delete(socket);
-    this.guestPlayers.delete(socket);
+  private async reconnect(gameId: string, id: string, socket: Socket) {
+    let game = this.games.get(gameId);
 
-    if (this.pendingPlayer?.socket === socket) {
-      this.pendingPlayer = null;
-    }
-
-    if (this.pendingGuest?.socket === socket) {
-      this.pendingGuest = null;
-    }
-
-    // 🔍 Find and remove the game where the player was
-    for (const [gameId, game] of this.games.entries()) {
-      const { player1, player2 } = game;
-
-      if (player1?.socket === socket) {
-        player2?.socket.send(
-          JSON.stringify({
-            type: PLAYER_LEFT,
-          })
+    if (!game) {
+      const gameData = await redis.get(`game:${gameId}`);
+      if (gameData) {
+        game = Game.fromJSON(gameData, (id: string) =>
+          this.socketByUserId.get(id)
         );
-      } else if (player2?.socket === socket) {
-        player1?.socket.send(
-          JSON.stringify({
-            type: PLAYER_LEFT,
-          })
-        );
+        this.games.set(gameId, game);
       }
-
-      // Delete the game immediately
-      this.games.delete(gameId);
-      break;
     }
-  }
 
-  private addHandler({ id, socket }: { id: string; socket: WebSocket }) {
-    socket.on("message", async (data) => {
-      const message = JSON.parse(data.toString());
+    const playerSide =
+      game?.player1.id === id ? game.player1.side : game?.player2.side;
 
-      if (message.type === INIT_GAME) {
-        if (this.pendingPlayer) {
-          // start the game
-          const game = new Game(this.pendingPlayer, { id, socket });
-          await game.createGameHandler();
-          this.games.set(game.gameId, game);
-          this.pendingPlayer = null;
-        } else {
-          this.pendingPlayer = { id, socket };
-        }
-      }
+    if (!playerSide) return;
 
-      if (message.type === MOVE) {
-        let game: Game | undefined;
-        for (const [gameId, currentGame] of this.games.entries()) {
-          if (currentGame.player1.id === id || currentGame.player2.id === id) {
-            game = currentGame;
-            break;
-          }
-        }
-
-        if (game) {
-          game.makeMove(message.payload.move);
-        }
-      }
+    socket.emit(RECONNECT, {
+      payload: {
+        fen: game?.board.fen(),
+        side: playerSide,
+      },
     });
   }
 
-  private addHandlerGuest({ id, socket }: { id: string; socket: WebSocket }) {
-    socket.on("message", async (data) => {
-      const message = JSON.parse(data.toString());
+  private addHandler({ id, socket }: { id: string; socket: Socket }) {
+    socket.on(INIT_GAME, async () => {
+      const pendingId = await redis.rpop("pendingPlayer");
 
-      if (message.type === INIT_GAME) {
-        if (this.pendingGuest) {
-          // Start guest vs guest game
-          const game = new Game(this.pendingGuest, { id, socket });
-          await game.createGameHandler();
-          this.games.set(game.gameId, game);
-          this.pendingGuest = null;
-        } else {
-          this.pendingGuest = { id, socket };
+      if (!pendingId) {
+        await redis.lpush("pendingPlayer", id);
+        return;
+      }
+
+      const pendingSocket = this.socketByUserId.get(pendingId);
+
+      if (!pendingSocket) {
+        await redis.lpush("pendingPlayer", id);
+        return;
+      }
+
+      const game = new Game(
+        { id: pendingId, socket: pendingSocket },
+        { id, socket }
+      );
+      game.createGameHandler();
+
+      await Promise.all([
+        redis.set(`game:${game.gameId}`, JSON.stringify(game.toJSON())),
+        redis.hset(`activePlayer:${id}`, { gameId: game.gameId }),
+        redis.hset(`activePlayer:${pendingId}`, {
+          gameId: game.gameId,
+        }),
+      ]);
+
+      this.games.set(game.gameId, game);
+    });
+
+    socket.on(MOVE, async (data) => {
+      const { gameId } = await redis.hgetall(`activePlayer:${id}`);
+      let game = this.games.get(gameId);
+
+      if (!game) {
+        const gameData = await redis.get(`game:${gameId}`);
+        if (gameData) {
+          game = Game.fromJSON(gameData, (id: string) =>
+            this.socketByUserId.get(id)
+          );
+          this.games.set(gameId, game);
         }
       }
 
-      if (message.type === MOVE) {
-        let game: Game | undefined;
-        for (const [gameId, currentGame] of this.games.entries()) {
-          if (currentGame.player1.id === id || currentGame.player2.id === id) {
-            game = currentGame;
-            break;
-          }
-        }
+      if (game) {
+        const moveResult = game.makeMove(data.payload.move);
 
-        if (game) {
-          game.makeMove(message.payload.move);
+        if (moveResult) {
+          await redis.set(`game:${game.gameId}`, JSON.stringify(game.toJSON()));
         }
       }
     });
