@@ -1,130 +1,119 @@
+import { redis } from "./config/redis.js";
 import { Game } from "./Game.js";
-import { INIT_GAME, MOVE, RECONNECT } from "./messages.js";
-import { redis } from "./app.js";
-import { Socket } from "socket.io";
+import { INIT_GAME, JOIN_GAME_ROOM, MOVE, RECONNECT } from "./messages.js";
+import { Server, Socket } from "socket.io";
 
 export class GameManager {
-  private games: Map<string, Game>;
-  private socketByUserId: Map<string, Socket>;
+  private io: Server;
 
-  constructor() {
-    this.games = new Map();
-    this.socketByUserId = new Map();
-  }
-
-  private getIdFromSocket(socket: Socket): string | undefined {
-    for (const [id, userSocket] of this.socketByUserId.entries()) {
-      if (socket === userSocket) {
-        return id;
-      }
-    }
+  constructor(io: Server) {
+    this.io = io;
   }
 
   async addUser(id: string, socket: Socket) {
-    this.socketByUserId.set(id, socket);
-    const { gameId } = await redis.hgetall(`activePlayer:${id}`);
+    const data = await redis.hgetall(`activePlayer:${id}`);
+
+    const { gameId } = data;
+
+    socket.data.userId = id;
+
+    await redis.hset(`activePlayer:${id}`, {
+      gameId: gameId || "",
+      socketId: socket.id,
+    });
+
     if (gameId) {
-      this.reconnect(gameId, id, socket);
-    } else {
-      await redis.hset(`activePlayer:${id}`, { gameId: "" });
+      await this.reconnect(gameId, id, socket);
     }
+
     this.addHandler({ id, socket });
   }
 
   async removeUser(socket: Socket) {
-    const id = this.getIdFromSocket(socket);
+    const id = socket.data.userId;
     if (!id) {
-      console.error("No id associated with socket");
+      console.error("No id on socket");
       return;
     }
-    this.socketByUserId.delete(id);
-    const { gameId } = await redis.hgetall(`activePlayer:${id}`);
-    if (!gameId) {
-      console.error(`No game found for user with ID ${id}`);
-      return;
-    }
-    this.games.delete(gameId);
+
+    await redis.hdel(`activePlayer:${id}`, "socketId");
+
+    await redis.lrem("pendingPlayer", 0, id);
   }
 
   private async reconnect(gameId: string, id: string, socket: Socket) {
-    let game = this.games.get(gameId);
+    const gameData = await redis.get(`game:${gameId}`);
+    if (!gameData) return;
 
-    if (!game) {
-      const gameData = await redis.get(`game:${gameId}`);
-      if (gameData) {
-        game = Game.fromJSON(gameData, (id: string) =>
-          this.socketByUserId.get(id)
-        );
-        this.games.set(gameId, game);
-      }
-    }
+    const game = Game.fromJSON(gameData, this.io);
 
-    const playerSide =
+    const side =
       game?.player1.id === id ? game.player1.side : game?.player2.side;
 
-    if (!playerSide) return;
-
+    socket.join(gameId);
     socket.emit(RECONNECT, {
       payload: {
-        fen: game?.board.fen(),
-        side: playerSide,
+        fen: game.board.fen(),
+        side,
       },
     });
   }
 
   private addHandler({ id, socket }: { id: string; socket: Socket }) {
     socket.on(INIT_GAME, async () => {
-      const pendingId = await redis.rpop("pendingPlayer");
-
-      if (!pendingId) {
-        await redis.lpush("pendingPlayer", id);
+      const pendingData = await redis.rpop("pendingPlayer");
+      if (!pendingData) {
+        await redis.lpush(
+          "pendingPlayer",
+          JSON.stringify({ id, socketId: socket.id })
+        );
         return;
       }
 
-      const pendingSocket = this.socketByUserId.get(pendingId);
-
-      if (!pendingSocket) {
-        await redis.lpush("pendingPlayer", id);
+      let pending;
+      try {
+        pending = JSON.parse(pendingData);
+      } catch (err) {
+        console.error("Failed to parse pending player data", err);
+        await redis.lpush(
+          "pendingPlayer",
+          JSON.stringify({ id, socketId: socket.id })
+        );
         return;
       }
 
-      const game = new Game(
-        { id: pendingId, socket: pendingSocket },
-        { id, socket }
-      );
-      game.createGameHandler();
+      const game = new Game(this.io, { id: pending.id }, { id });
 
       await Promise.all([
         redis.set(`game:${game.gameId}`, JSON.stringify(game.toJSON())),
-        redis.hset(`activePlayer:${id}`, { gameId: game.gameId }),
-        redis.hset(`activePlayer:${pendingId}`, {
+        redis.hset(`activePlayer:${id}`, {
+          gameId: game.gameId,
+        }),
+        redis.hset(`activePlayer:${pending.id}`, {
           gameId: game.gameId,
         }),
       ]);
 
-      this.games.set(game.gameId, game);
+      await game.createGameHandler();
+    });
+
+    socket.on(JOIN_GAME_ROOM, (gameId: string) => {
+      socket.join(gameId);
     });
 
     socket.on(MOVE, async (data) => {
       const { gameId } = await redis.hgetall(`activePlayer:${id}`);
-      let game = this.games.get(gameId);
+      if (!gameId) return;
 
-      if (!game) {
-        const gameData = await redis.get(`game:${gameId}`);
-        if (gameData) {
-          game = Game.fromJSON(gameData, (id: string) =>
-            this.socketByUserId.get(id)
-          );
-          this.games.set(gameId, game);
-        }
-      }
+      const gameData = await redis.get(`game:${gameId}`);
+      if (!gameData) return;
 
-      if (game) {
-        const moveResult = game.makeMove(data.payload.move);
+      const game = Game.fromJSON(gameData, this.io);
+      if (!game) return;
 
-        if (moveResult) {
-          await redis.set(`game:${game.gameId}`, JSON.stringify(game.toJSON()));
-        }
+      const moveResult = await game.makeMove(data.payload.move, socket);
+      if (moveResult) {
+        await redis.set(`game:${game.gameId}`, JSON.stringify(game.toJSON()));
       }
     });
   }

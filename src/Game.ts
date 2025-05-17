@@ -1,7 +1,8 @@
 import { Chess, Square } from "chess.js";
 import { GAME_OVER, INIT_GAME, MOVE } from "./messages.js";
 import { randomUUID } from "crypto";
-import { Socket } from "socket.io";
+import { Server, Socket } from "socket.io";
+import { redis } from "./config/redis.js";
 
 type PromotionPieceOption =
   | "wQ"
@@ -15,7 +16,6 @@ type PromotionPieceOption =
 
 type Player = {
   id: string;
-  socket: Socket;
   side: Side;
 };
 
@@ -44,32 +44,34 @@ export class Game {
   public board: Chess;
   private status: Status;
 
+  private io: Server;
+
   constructor(
+    io: Server,
     player1: {
       id: string;
-      socket: Socket;
       side?: Side;
     },
     player2: {
       id: string;
-      socket: Socket;
       side?: Side;
     },
     gameId?: string
   ) {
+    this.io = io;
     this.player1 = {
-      ...player1,
+      id: player1.id,
       side: player1.side ?? (Math.random() < 0.5 ? Side.WHITE : Side.BLACK),
     };
     this.player2 = {
-      ...player2,
+      id: player2.id,
       side:
         player2.side ??
         (this.player1.side === Side.WHITE ? Side.BLACK : Side.WHITE),
     };
     this.board = new Chess();
-    this.gameId = gameId ?? randomUUID();
     this.status = Status.Active;
+    this.gameId = gameId ?? randomUUID();
   }
 
   toJSON(): GameData {
@@ -82,62 +84,57 @@ export class Game {
     };
   }
 
-  static fromJSON(
-    data: string,
-    getSocketById: (id: string) => Socket | undefined
-  ) {
+  static fromJSON(data: string, io: Server) {
     const parsed: GameData = JSON.parse(data);
-
-    const socket1 = getSocketById(parsed.player1.id);
-    const socket2 = getSocketById(parsed.player2.id);
-
-    if (!socket1 || !socket2) {
-      throw new Error("Missing socket for one or both players");
-    }
 
     const player1 = {
       id: parsed.player1.id,
-      socket: socket1,
       side: parsed.player1.side,
     };
     const player2 = {
       id: parsed.player2.id,
-      socket: socket2,
       side: parsed.player2.side,
     };
 
-    const game = new Game(player1, player2, parsed.gameId);
+    const game = new Game(io, player1, player2, parsed.gameId);
     game.board.load(parsed.fen);
     game.status = parsed.status;
 
     return game;
   }
 
-  createGameHandler() {
-    if (this.player1) {
-      this.player1.socket.emit(INIT_GAME, {
-        payload: {
-          side: this.player1.side,
-          gameId: this.gameId,
-        },
-      });
-    }
-
-    if (this.player2) {
-      this.player2.socket.emit(INIT_GAME, {
-        payload: {
-          side: this.player2.side,
-          gameId: this.gameId,
-        },
-      });
-    }
+  private async getSocketIdById(id: string) {
+    const { socketId } = await redis.hgetall(`activePlayer:${id}`);
+    return socketId;
   }
 
-  makeMove(move: {
-    from: Square;
-    to: Square;
-    promotion?: PromotionPieceOption;
-  }) {
+  async createGameHandler() {
+    const player1SocketId = await this.getSocketIdById(this.player1.id);
+    const player2SocketId = await this.getSocketIdById(this.player2.id);
+
+    this.io.to(player1SocketId).emit(INIT_GAME, {
+      payload: {
+        side: this.player1.side,
+        gameId: this.gameId,
+      },
+    });
+
+    this.io.to(player2SocketId).emit(INIT_GAME, {
+      payload: {
+        side: this.player2.side,
+        gameId: this.gameId,
+      },
+    });
+  }
+
+  async makeMove(
+    move: {
+      from: Square;
+      to: Square;
+      promotion?: PromotionPieceOption;
+    },
+    moverSocket: Socket
+  ) {
     let moveResult;
     try {
       moveResult = this.board.move(move);
@@ -146,11 +143,7 @@ export class Game {
       return;
     }
 
-    if (this.board.turn() === this.player1.side[0]) {
-      this.player1.socket.emit(MOVE, { payload: { move } });
-    } else {
-      this.player2.socket.emit(MOVE, { payload: { move } });
-    }
+    moverSocket.to(this.gameId).emit(MOVE, { payload: { move } });
 
     if (this.board.isGameOver()) {
       const result = this.board.isCheckmate()
@@ -159,17 +152,19 @@ export class Game {
           : "black"
         : "draw";
 
-      this.player1.socket.emit(GAME_OVER, {
+      this.status = Status.Over;
+
+      this.io.to(this.gameId).emit(GAME_OVER, {
         payload: {
           result,
         },
       });
 
-      this.player2.socket.emit(GAME_OVER, {
-        payload: {
-          result,
-        },
-      });
+      await Promise.all([
+        redis.del(`game:${this.gameId}`),
+        redis.hdel(`activePlayer:${this.player1.id}`, "gameId"),
+        redis.hdel(`activePlayer:${this.player2.id}`, "gameId"),
+      ]);
     }
 
     return moveResult;

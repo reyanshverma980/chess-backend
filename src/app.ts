@@ -1,52 +1,51 @@
 import dotenv from "dotenv";
+// Load environment variables
+dotenv.config();
+
 import express from "express";
 import http from "http";
 import cors from "cors";
-import mongoose from "mongoose";
 import authRouter from "./routes/auth.js";
 import { Server } from "socket.io";
 import { GameManager } from "./GameManager.js";
-import Redis from "ioredis";
+import { createAdapter } from "@socket.io/redis-adapter";
+import helmet from "helmet";
+import { initRedisClients, pubClient, subClient } from "./config/redis.js";
+import { connectToDatabase } from "./config/db.js";
 
-dotenv.config();
-
-const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGO_URI!);
-    console.log("🔥 MongoDB Connected");
-  } catch (error: any) {
-    console.error("MongoDB Connection Error:", error.message);
-    process.exit(1); // Exit process if connection fails
-  }
-};
-
-export const redis = new Redis({
-  host: process.env.REDIS_HOST || "localhost",
-  port: Number(process.env.REDIS_PORT) || 6379,
-  password: process.env.REDIS_PASSWORD!,
-});
-
+// Environment config
 const PORT = process.env.PORT || 5001;
 const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
 
+initRedisClients();
+
+// Express app
 const app = express();
+
 app.use(
   cors({
     origin: frontendUrl, // Frontend URL
     credentials: true, // Allow cookies/auth headers
-    methods: ["GET", "POST", "PUT", "DELETE"], // Allowed methods
-    allowedHeaders: ["Content-Type", "Authorization"], // Allowed headers
   })
 );
-
+app.use(helmet());
 app.use(express.json());
+
+// Routes
 app.use("/api", authRouter);
-connectDB();
 
+// HTTP + Socket Server
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL,
+    credentials: true,
+  },
+});
 
-const gameManager = new GameManager();
+io.adapter(createAdapter(pubClient, subClient));
+
+const gameManager = new GameManager(io);
 
 io.on("connection", (socket) => {
   const id = socket.handshake.auth?.userId;
@@ -65,6 +64,14 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+(async () => {
+  try {
+    await connectToDatabase();
+    server.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error("Failed to connect to DB:", err);
+    process.exit(1);
+  }
+})();
