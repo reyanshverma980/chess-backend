@@ -9,11 +9,13 @@
     "dev": "nodemon --watch src --ext ts --exec 'node --loader ts-node/esm' src/app.ts"
   },
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "bcrypt": "^5.1.1",
     "chess.js": "^1.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "helmet": "^8.1.0",
     "ioredis": "^5.6.1",
     "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.15.0",
@@ -28,6 +30,7 @@
     "@types/express": "^5.0.1",
     "@types/jsonwebtoken": "^9.0.9",
     "@types/node": "^22.13.14",
+    "@types/socket.io-redis": "^1.0.27",
     "nodemon": "^3.1.9",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
